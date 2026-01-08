@@ -14,3 +14,4 @@ echo デスクトップに「%SHORTCUT_NAME%」が追加されています。
 echo.
 pause
 
+

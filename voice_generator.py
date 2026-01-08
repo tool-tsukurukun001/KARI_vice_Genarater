@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-ElevenLabs Voice Generator Tool
-エクセルの台詞リストからElevenLabs TTSで音声ファイルを一括生成するツール
+VoiceVox Voice Generator Tool
+エクセルの台詞リストからVoiceVox TTSで音声ファイルを一括生成するツール
 """
 
 import tkinter as tk
@@ -11,61 +11,131 @@ import os
 import threading
 import tempfile
 import time
-from pathlib import Path
+import re
+import wave
+import struct
 
 import openpyxl
 import requests
-from pydub import AudioSegment
 import pygame
 
 # 設定ファイルのパス
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
+# VoiceVoxのデフォルトURL
+VOICEVOX_URL = "http://localhost:50021"
 
-class ElevenLabsAPI:
-    """ElevenLabs API連携クラス"""
+# 感情判定用のキーワード
+EMOTION_KEYWORDS = {
+    "あまあま": ["好き", "大好き", "愛してる", "嬉しい", "幸せ", "ありがとう", "素敵", "可愛い", "優しい", "♡", "♥", "にこ", "わーい", "やったー"],
+    "ツンツン": ["べ、別に", "バカ", "ばか", "アホ", "あほ", "うるさい", "知らない", "嫌い", "ふん", "はぁ？", "なによ", "ちがう", "違う", "勘違い"],
+    "セクシー": ["ふふ", "うふふ", "ねぇ", "ダメ", "だめ", "いけない", "秘密", "ひみつ", "誘", "触", "キス", "抱"],
+    "ささやき": ["しー", "内緒", "ないしょ", "こっそり", "静かに", "小声", "ひそひそ"],
+    "ヒソヒソ": ["しー", "内緒", "ないしょ", "こっそり", "静かに", "小声", "ひそひそ"],
+    "怒り": ["怒", "許さない", "ゆるさない", "ふざけるな", "なんだと", "くそ", "クソ", "ちくしょう", "畜生", "殺", "死ね"],
+    "悲しみ": ["悲しい", "寂しい", "さみしい", "辛い", "つらい", "泣", "涙", "ごめん", "すまない", "申し訳"],
+    "喜び": ["嬉しい", "うれしい", "楽しい", "たのしい", "わーい", "やった", "最高", "すごい", "素晴らしい"],
+}
+
+
+class VoiceVoxAPI:
+    """VoiceVox API連携クラス"""
     
-    BASE_URL = "https://api.elevenlabs.io/v1"
+    def __init__(self, base_url: str = VOICEVOX_URL):
+        self.base_url = base_url
     
-    def __init__(self, api_key: str):
-        self.api_key = api_key
-        self.headers = {
-            "xi-api-key": api_key,
-            "Content-Type": "application/json"
-        }
-    
-    def get_voices(self) -> list:
-        """利用可能なボイス一覧を取得"""
+    def is_running(self) -> bool:
+        """VoiceVoxが起動しているか確認"""
         try:
-            response = requests.get(
-                f"{self.BASE_URL}/voices",
-                headers=self.headers
-            )
+            response = requests.get(f"{self.base_url}/speakers", timeout=3)
+            return response.status_code == 200
+        except:
+            return False
+    
+    def get_speakers(self) -> list:
+        """話者一覧を取得"""
+        try:
+            response = requests.get(f"{self.base_url}/speakers")
             response.raise_for_status()
-            data = response.json()
-            return data.get("voices", [])
+            return response.json()
         except Exception as e:
-            raise Exception(f"ボイス一覧の取得に失敗しました: {e}")
+            raise Exception(f"話者一覧の取得に失敗しました: {e}")
     
-    def generate_speech(self, text: str, voice_id: str) -> bytes:
-        """テキストから音声を生成"""
+    def get_speaker_styles(self) -> dict:
+        """話者とスタイルの辞書を作成 {speaker_name: [(style_name, style_id), ...]}"""
+        speakers = self.get_speakers()
+        result = {}
+        for speaker in speakers:
+            name = speaker["name"]
+            styles = [(style["name"], style["id"]) for style in speaker["styles"]]
+            result[name] = styles
+        return result
+    
+    def generate_audio_query(self, text: str, speaker_id: int) -> dict:
+        """音声合成用のクエリを生成"""
+        response = requests.post(
+            f"{self.base_url}/audio_query",
+            params={"text": text, "speaker": speaker_id}
+        )
+        response.raise_for_status()
+        return response.json()
+    
+    def synthesize(self, audio_query: dict, speaker_id: int) -> bytes:
+        """音声を合成"""
+        response = requests.post(
+            f"{self.base_url}/synthesis",
+            params={"speaker": speaker_id},
+            json=audio_query
+        )
+        response.raise_for_status()
+        return response.content
+    
+    def generate_speech(self, text: str, speaker_id: int) -> bytes:
+        """テキストから音声を生成（WAV形式）"""
         try:
-            response = requests.post(
-                f"{self.BASE_URL}/text-to-speech/{voice_id}",
-                headers=self.headers,
-                json={
-                    "text": text,
-                    "model_id": "eleven_multilingual_v2",
-                    "voice_settings": {
-                        "stability": 0.5,
-                        "similarity_boost": 0.75
-                    }
-                }
-            )
-            response.raise_for_status()
-            return response.content
+            query = self.generate_audio_query(text, speaker_id)
+            audio_data = self.synthesize(query, speaker_id)
+            return audio_data
         except Exception as e:
             raise Exception(f"音声生成に失敗しました: {e}")
+
+
+class EmotionAnalyzer:
+    """台詞から感情を分析するクラス"""
+    
+    @staticmethod
+    def analyze(text: str, available_styles: list) -> str:
+        """
+        台詞から最適なスタイルを判定
+        available_styles: [(style_name, style_id), ...]
+        """
+        available_style_names = [s[0] for s in available_styles]
+        
+        # 各感情のスコアを計算
+        scores = {}
+        for emotion, keywords in EMOTION_KEYWORDS.items():
+            score = 0
+            for keyword in keywords:
+                if keyword in text:
+                    score += 1
+            if score > 0:
+                scores[emotion] = score
+        
+        # スコアが高い順にソート
+        if scores:
+            sorted_emotions = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+            for emotion, _ in sorted_emotions:
+                # 利用可能なスタイルに含まれているか確認
+                for style_name in available_style_names:
+                    if emotion in style_name or emotion.lower() in style_name.lower():
+                        return style_name
+        
+        # デフォルトは「ノーマル」または最初のスタイル
+        for style_name in available_style_names:
+            if "ノーマル" in style_name or "normal" in style_name.lower():
+                return style_name
+        
+        return available_style_names[0] if available_style_names else "ノーマル"
 
 
 class ExcelReader:
@@ -151,14 +221,26 @@ class AudioConverter:
     """音声変換クラス"""
     
     @staticmethod
-    def mp3_to_wav(mp3_data: bytes, output_path: str):
-        """MP3データをWAV (16bit, 44100Hz) に変換して保存"""
-        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
-            tmp.write(mp3_data)
+    def convert_to_16bit_44100hz(input_data: bytes, output_path: str):
+        """WAVデータを16bit 44100Hzに変換して保存"""
+        # 一時ファイルに保存
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp.write(input_data)
             tmp_path = tmp.name
         
         try:
-            audio = AudioSegment.from_mp3(tmp_path)
+            # WAVファイルを読み込み
+            with wave.open(tmp_path, 'rb') as wav_in:
+                n_channels = wav_in.getnchannels()
+                sampwidth = wav_in.getsampwidth()
+                framerate = wav_in.getframerate()
+                n_frames = wav_in.getnframes()
+                audio_data = wav_in.readframes(n_frames)
+            
+            # VoiceVoxは24000Hzで出力するので、44100Hzにリサンプリング
+            # 簡易的な方法：pydubを使用
+            from pydub import AudioSegment
+            audio = AudioSegment.from_wav(tmp_path)
             audio = audio.set_frame_rate(44100).set_sample_width(2).set_channels(2)
             audio.export(output_path, format="wav")
         finally:
@@ -170,12 +252,11 @@ class VoiceGeneratorApp:
     
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("ElevenLabs Voice Generator")
-        self.root.geometry("900x800")
+        self.root.title("VoiceVox Voice Generator")
+        self.root.geometry("900x850")
         self.root.resizable(True, True)
         
         # 変数の初期化
-        self.api_key = tk.StringVar()
         self.excel_path = tk.StringVar()
         self.sheet_name = tk.StringVar()
         self.char_column = tk.StringVar()
@@ -183,12 +264,13 @@ class VoiceGeneratorApp:
         self.filename_column = tk.StringVar()
         self.start_row = tk.StringVar(value="2")
         self.output_path = tk.StringVar()
+        self.auto_emotion = tk.BooleanVar(value=True)
         
         self.excel_reader = None
-        self.elevenlabs_api = None
-        self.voices = []
+        self.voicevox_api = None
+        self.speaker_styles = {}  # {speaker_name: [(style_name, style_id), ...]}
         self.characters = []
-        self.voice_combos = {}
+        self.voice_combos = {}  # {character: (speaker_var, style_var)}
         
         # pygame初期化（音声再生用）
         pygame.mixer.init()
@@ -198,24 +280,27 @@ class VoiceGeneratorApp:
         
         # UIを構築
         self.build_ui()
+        
+        # VoiceVox接続確認
+        self.check_voicevox()
     
     def load_config(self):
-        """設定ファイルからAPIキーを読み込み"""
+        """設定ファイルを読み込み"""
         if os.path.exists(CONFIG_FILE):
             try:
                 with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                     config = json.load(f)
-                    self.api_key.set(config.get("api_key", ""))
+                    # 必要に応じて設定を読み込み
             except:
                 pass
     
     def save_config(self):
-        """設定ファイルにAPIキーを保存"""
+        """設定ファイルに保存"""
         try:
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-                json.dump({"api_key": self.api_key.get()}, f)
-        except Exception as e:
-            messagebox.showerror("エラー", f"設定の保存に失敗しました: {e}")
+                json.dump({}, f)
+        except:
+            pass
     
     def build_ui(self):
         """UIを構築"""
@@ -239,19 +324,18 @@ class VoiceGeneratorApp:
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         
-        # ===== セクション1: APIキー =====
-        section1 = ttk.LabelFrame(main_frame, text="① APIキー設定", padding="10")
+        # ===== セクション1: VoiceVox接続状態 =====
+        section1 = ttk.LabelFrame(main_frame, text="① VoiceVox接続状態", padding="10")
         section1.pack(fill=tk.X, pady=(0, 10))
         
-        ttk.Label(section1, text="ElevenLabs APIキー:").pack(anchor=tk.W)
-        api_frame = ttk.Frame(section1)
-        api_frame.pack(fill=tk.X, pady=(5, 0))
+        status_frame = ttk.Frame(section1)
+        status_frame.pack(fill=tk.X)
         
-        self.api_entry = ttk.Entry(api_frame, textvariable=self.api_key, show="*", width=60)
-        self.api_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.voicevox_status = ttk.Label(status_frame, text="確認中...", foreground="gray")
+        self.voicevox_status.pack(side=tk.LEFT)
         
-        ttk.Button(api_frame, text="保存", command=self.save_api_key).pack(side=tk.LEFT, padx=(5, 0))
-        ttk.Button(api_frame, text="接続テスト", command=self.test_api_connection).pack(side=tk.LEFT, padx=(5, 0))
+        ttk.Button(status_frame, text="再接続", command=self.check_voicevox).pack(side=tk.LEFT, padx=(10, 0))
+        ttk.Label(status_frame, text="※VoiceVoxを起動してから「再接続」を押してください").pack(side=tk.LEFT, padx=(10, 0))
         
         # ===== セクション2: エクセルファイル =====
         section2 = ttk.LabelFrame(main_frame, text="② エクセルファイルを選択", padding="10")
@@ -318,8 +402,14 @@ class VoiceGeneratorApp:
         self.char_listbox.config(yscrollcommand=char_scrollbar.set)
         
         # ===== セクション5: ボイス割り当て =====
-        section5 = ttk.LabelFrame(main_frame, text="⑤⑥⑦ キャラクターにElevenLabsボイスを割り当て（プレビュー可能）", padding="10")
+        section5 = ttk.LabelFrame(main_frame, text="⑤⑥⑦ キャラクターにVoiceVoxボイスを割り当て（プレビュー可能）", padding="10")
         section5.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        
+        # 感情自動判定オプション
+        emotion_frame = ttk.Frame(section5)
+        emotion_frame.pack(fill=tk.X, pady=(0, 10))
+        ttk.Checkbutton(emotion_frame, text="台詞の内容から感情（スタイル）を自動判定する", 
+                        variable=self.auto_emotion).pack(side=tk.LEFT)
         
         ttk.Button(section5, text="選択したキャラクターのボイス設定を開始", 
                    command=self.setup_voice_assignment).pack(pady=(0, 10))
@@ -359,24 +449,18 @@ class VoiceGeneratorApp:
         self.status_label = ttk.Label(section6, text="")
         self.status_label.pack()
     
-    def save_api_key(self):
-        """APIキーを保存"""
-        self.save_config()
-        messagebox.showinfo("完了", "APIキーを保存しました")
-    
-    def test_api_connection(self):
-        """API接続テスト"""
-        if not self.api_key.get():
-            messagebox.showerror("エラー", "APIキーを入力してください")
-            return
+    def check_voicevox(self):
+        """VoiceVoxの接続を確認"""
+        self.voicevox_api = VoiceVoxAPI()
         
-        try:
-            self.elevenlabs_api = ElevenLabsAPI(self.api_key.get())
-            self.voices = self.elevenlabs_api.get_voices()
-            messagebox.showinfo("成功", f"接続成功！{len(self.voices)}個のボイスが利用可能です")
-            self.save_config()
-        except Exception as e:
-            messagebox.showerror("エラー", str(e))
+        if self.voicevox_api.is_running():
+            self.voicevox_status.config(text="✓ VoiceVox接続OK", foreground="green")
+            try:
+                self.speaker_styles = self.voicevox_api.get_speaker_styles()
+            except Exception as e:
+                self.voicevox_status.config(text=f"話者取得エラー: {e}", foreground="red")
+        else:
+            self.voicevox_status.config(text="✗ VoiceVoxが起動していません", foreground="red")
     
     def browse_excel(self):
         """エクセルファイルを選択"""
@@ -418,7 +502,7 @@ class VoiceGeneratorApp:
             self.characters = []
             
             self.status_label.config(text="")
-            messagebox.showinfo("成功", f"エクセルファイルを読み込みました\nシート数: {len(sheet_names)}\n\n使用するシートを選択して「シートを選択」ボタンを押してください")
+            messagebox.showinfo("成功", f"エクセルファイルを読み込みました\nシート数: {len(sheet_names)}")
         except Exception as e:
             self.status_label.config(text="")
             messagebox.showerror("エラー", f"読み込みに失敗しました: {e}")
@@ -457,7 +541,7 @@ class VoiceGeneratorApp:
             self.status_label.config(text="")
             
             row_count = len(self.excel_reader.cached_data) if self.excel_reader.cached_data else 0
-            messagebox.showinfo("成功", f"シート「{self.sheet_name.get()}」を読み込みました\n行数: {row_count}行\n列: {', '.join(columns)}")
+            messagebox.showinfo("成功", f"シート「{self.sheet_name.get()}」を読み込みました\n行数: {row_count}行")
         except Exception as e:
             self.status_label.config(text="")
             messagebox.showerror("エラー", f"シートの読み込みに失敗しました: {e}")
@@ -505,19 +589,15 @@ class VoiceGeneratorApp:
             messagebox.showerror("エラー", "書き出すキャラクターを選択してください")
             return
         
-        if not self.elevenlabs_api:
-            try:
-                self.elevenlabs_api = ElevenLabsAPI(self.api_key.get())
-                self.voices = self.elevenlabs_api.get_voices()
-            except Exception as e:
-                messagebox.showerror("エラー", f"API接続に失敗しました: {e}")
-                return
+        if not self.speaker_styles:
+            messagebox.showerror("エラー", "VoiceVoxが接続されていません。VoiceVoxを起動して「再接続」を押してください")
+            return
         
         for widget in self.voice_assign_frame.winfo_children():
             widget.destroy()
         
         selected_chars = [self.characters[i] for i in selected_indices]
-        voice_names = [v["name"] for v in self.voices]
+        speaker_names = list(self.speaker_styles.keys())
         
         self.voice_combos = {}
         
@@ -525,41 +605,71 @@ class VoiceGeneratorApp:
             row_frame = ttk.Frame(self.voice_assign_frame)
             row_frame.pack(fill=tk.X, pady=5)
             
-            ttk.Label(row_frame, text=f"{char}:", width=20, anchor=tk.W).pack(side=tk.LEFT)
+            ttk.Label(row_frame, text=f"{char}:", width=15, anchor=tk.W).pack(side=tk.LEFT)
             
-            voice_var = tk.StringVar()
-            voice_combo = ttk.Combobox(row_frame, textvariable=voice_var, values=voice_names, width=25, state="readonly")
-            voice_combo.pack(side=tk.LEFT, padx=(5, 10))
-            if voice_names:
-                voice_combo.current(0)
+            # 話者選択
+            speaker_var = tk.StringVar()
+            speaker_combo = ttk.Combobox(row_frame, textvariable=speaker_var, values=speaker_names, width=15, state="readonly")
+            speaker_combo.pack(side=tk.LEFT, padx=(5, 5))
+            if speaker_names:
+                speaker_combo.current(0)
             
-            self.voice_combos[char] = voice_var
+            # スタイル選択
+            style_var = tk.StringVar()
+            style_combo = ttk.Combobox(row_frame, textvariable=style_var, width=12, state="readonly")
+            style_combo.pack(side=tk.LEFT, padx=(5, 10))
             
+            # 話者が変更されたらスタイルを更新
+            def update_styles(event, sv=speaker_var, sc=style_combo, stv=style_var):
+                speaker = sv.get()
+                if speaker in self.speaker_styles:
+                    styles = [s[0] for s in self.speaker_styles[speaker]]
+                    sc["values"] = styles
+                    if styles:
+                        sc.current(0)
+            
+            speaker_combo.bind("<<ComboboxSelected>>", update_styles)
+            
+            # 初期スタイルを設定
+            if speaker_names:
+                first_speaker = speaker_names[0]
+                styles = [s[0] for s in self.speaker_styles[first_speaker]]
+                style_combo["values"] = styles
+                if styles:
+                    style_combo.current(0)
+            
+            self.voice_combos[char] = (speaker_var, style_var, style_combo)
+            
+            # プレビューボタン
             preview_btn = ttk.Button(row_frame, text="▶ プレビュー", 
-                                     command=lambda c=char, v=voice_var: self.preview_voice(c, v))
+                                     command=lambda c=char: self.preview_voice(c))
             preview_btn.pack(side=tk.LEFT)
         
         messagebox.showinfo("準備完了", f"{len(selected_chars)}人のキャラクターのボイス設定ができます")
     
-    def preview_voice(self, character: str, voice_var: tk.StringVar):
-        """選択したボイスでプレビュー再生"""
+    def get_style_id(self, speaker_name: str, style_name: str) -> int:
+        """話者名とスタイル名からスタイルIDを取得"""
+        if speaker_name in self.speaker_styles:
+            for name, id in self.speaker_styles[speaker_name]:
+                if name == style_name:
+                    return id
+        return 0
+    
+    def preview_voice(self, character: str):
+        """選択したボイスでプレビュー再生（選択中のスタイルをそのまま使用）"""
         if not self.excel_reader:
             messagebox.showerror("エラー", "エクセルファイルを読み込んでください")
             return
         
-        voice_name = voice_var.get()
-        if not voice_name:
-            messagebox.showerror("エラー", "ボイスを選択してください")
+        if character not in self.voice_combos:
             return
         
-        voice_id = None
-        for v in self.voices:
-            if v["name"] == voice_name:
-                voice_id = v["voice_id"]
-                break
+        speaker_var, style_var, style_combo = self.voice_combos[character]
+        speaker_name = speaker_var.get()
+        style_name = style_var.get()
         
-        if not voice_id:
-            messagebox.showerror("エラー", "ボイスが見つかりません")
+        if not speaker_name or not style_name:
+            messagebox.showerror("エラー", "話者とスタイルを選択してください")
             return
         
         try:
@@ -579,21 +689,24 @@ class VoiceGeneratorApp:
         
         first_dialogue = rows[0]["dialogue"]
         
+        # プレビューでは選択中のスタイルをそのまま使用（自動判定しない）
+        style_id = self.get_style_id(speaker_name, style_name)
+        
         def generate_preview():
             tmp_path = None
             try:
                 display_text = first_dialogue[:30] + "..." if len(first_dialogue) > 30 else first_dialogue
                 self.status_label.config(text=f"プレビュー生成中: 「{display_text}」")
-                mp3_data = self.elevenlabs_api.generate_speech(first_dialogue, voice_id)
+                wav_data = self.voicevox_api.generate_speech(first_dialogue, style_id)
                 
-                with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
-                    tmp.write(mp3_data)
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                    tmp.write(wav_data)
                     tmp_path = tmp.name
                 
                 pygame.mixer.music.load(tmp_path)
                 pygame.mixer.music.play()
                 
-                self.status_label.config(text=f"再生中: {character} - {voice_name}")
+                self.status_label.config(text=f"再生中: {character} - {speaker_name}（{style_name}）")
                 
                 while pygame.mixer.music.get_busy():
                     time.sleep(0.1)
@@ -601,7 +714,7 @@ class VoiceGeneratorApp:
                 self.status_label.config(text="")
                 
             except Exception as e:
-                self.status_label.config(text="")
+                self.status_label.config(text=f"エラー: {str(e)[:50]}")
             finally:
                 if tmp_path:
                     try:
@@ -632,33 +745,47 @@ class VoiceGeneratorApp:
             messagebox.showerror("エラー", "エクセルファイルを読み込んでください")
             return
         
-        os.makedirs(self.output_path.get(), exist_ok=True)
+        if not self.voicevox_api or not self.voicevox_api.is_running():
+            messagebox.showerror("エラー", "VoiceVoxが起動していません")
+            return
         
-        char_voice_map = {}
-        for char, voice_var in self.voice_combos.items():
-            voice_name = voice_var.get()
-            for v in self.voices:
-                if v["name"] == voice_name:
-                    char_voice_map[char] = v["voice_id"]
-                    break
+        os.makedirs(self.output_path.get(), exist_ok=True)
         
         try:
             start_row = int(self.start_row.get())
         except:
             start_row = 2
         
+        # タスクを収集
         tasks = []
-        for char, voice_id in char_voice_map.items():
+        for char, (speaker_var, style_var, style_combo) in self.voice_combos.items():
+            speaker_name = speaker_var.get()
+            base_style_name = style_var.get()
+            
             rows = self.excel_reader.get_rows_for_character(
                 self.char_column.get(), char,
                 self.dialogue_column.get(), self.filename_column.get(),
                 start_row
             )
+            
             for row in rows:
+                dialogue = row["dialogue"]
+                
+                # 感情自動判定
+                if self.auto_emotion.get():
+                    styles = self.speaker_styles.get(speaker_name, [])
+                    style_name = EmotionAnalyzer.analyze(dialogue, styles)
+                else:
+                    style_name = base_style_name
+                
+                style_id = self.get_style_id(speaker_name, style_name)
+                
                 tasks.append({
                     "character": char,
-                    "voice_id": voice_id,
-                    "dialogue": row["dialogue"],
+                    "speaker": speaker_name,
+                    "style": style_name,
+                    "style_id": style_id,
+                    "dialogue": dialogue,
                     "filename": row["filename"]
                 })
         
@@ -682,9 +809,10 @@ class VoiceGeneratorApp:
                     self.status_label.config(
                         text=f"生成中 ({i+1}/{len(tasks)}): {task['filename']}"
                     )
+                    self.root.update()
                     
-                    mp3_data = self.elevenlabs_api.generate_speech(
-                        task["dialogue"], task["voice_id"]
+                    wav_data = self.voicevox_api.generate_speech(
+                        task["dialogue"], task["style_id"]
                     )
                     
                     filename = task["filename"]
@@ -692,7 +820,9 @@ class VoiceGeneratorApp:
                         filename += ".wav"
                     
                     output_file = os.path.join(self.output_path.get(), filename)
-                    AudioConverter.mp3_to_wav(mp3_data, output_file)
+                    
+                    # 16bit 44100Hzに変換して保存
+                    AudioConverter.convert_to_16bit_44100hz(wav_data, output_file)
                     
                     success_count += 1
                     
