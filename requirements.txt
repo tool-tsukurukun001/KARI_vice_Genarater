@@ -1,0 +1,18 @@
+# ElevenLabs Voice Generator Tool
+# Python 3.8+ required
+
+# Excel file handling
+openpyxl>=3.1.2
+
+# ElevenLabs API
+elevenlabs>=1.0.0
+
+# Audio processing (MP3 to WAV conversion)
+pydub>=0.25.1
+
+# HTTP requests
+requests>=2.31.0
+
+# Audio playback for preview
+pygame>=2.5.0
+
