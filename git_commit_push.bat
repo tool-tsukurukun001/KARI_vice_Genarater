@@ -12,7 +12,7 @@ git add .
 
 echo.
 echo コミットしています...
-git commit -m "VoiceVox版に変更: 感情自動判定機能追加、プレビュー修正"
+git commit -m "VoiceVox版追加、ElevenLabs版を記録用に保存"
 
 echo.
 echo GitHubにプッシュしています...
@@ -24,4 +24,6 @@ echo 完了しました！
 echo ========================================
 echo.
 pause
+
+
 
